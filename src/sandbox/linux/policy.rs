@@ -15,7 +15,7 @@ use std::fmt::Write;
 pub fn render(params: &SandboxParams) -> String {
     let support = Support::detect();
     let out_rules = rules::build(params);
-    render_with(params, &out_rules, support, net::user_namespace_available())
+    render_with(params, &out_rules, support, net::namespace_usable(false))
 }
 
 /// Rendering split from probing so it can be tested deterministically.
@@ -51,7 +51,7 @@ fn render_with(
 ///
 /// Shared by `--dry-run` (as comment lines) and `--explain`.
 pub fn notes(params: &SandboxParams) -> Vec<String> {
-    notes_with(params, Support::detect(), net::user_namespace_available())
+    notes_with(params, Support::detect(), net::namespace_usable(false))
 }
 
 fn notes_with(params: &SandboxParams, support: Support, userns: bool) -> Vec<String> {
@@ -117,12 +117,10 @@ fn network_plan(mode: NetworkMode, userns: bool) -> String {
     match (mode, userns) {
         (NetworkMode::Online, _) => "unrestricted".to_string(),
         (NetworkMode::Offline, true) => "private network namespace".to_string(),
-        (NetworkMode::Offline, false) => {
-            "seccomp fallback (user namespaces unavailable)".to_string()
-        }
+        (NetworkMode::Offline, false) => "seccomp fallback (no usable user namespace)".to_string(),
         (NetworkMode::Localhost, true) => "private network namespace with loopback".to_string(),
         (NetworkMode::Localhost, false) => {
-            "UNAVAILABLE - user namespaces are blocked on this system".to_string()
+            "UNAVAILABLE - no usable user namespace on this system".to_string()
         }
     }
 }

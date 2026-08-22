@@ -30,10 +30,12 @@ pub const APPLY_FLAG: &str = "--sandbox-apply";
 /// the moment `sx` writes it and the moment the helper reads it. The child's
 /// environment is set by the parent at `execve` time and cannot be altered by
 /// anyone else, which removes the window rather than narrowing it.
+#[cfg(target_os = "linux")]
 pub const SPEC_ENV: &str = "SX_SANDBOX_SPEC";
 
 /// Refuse specs that would not survive `execve`, rather than failing with a
 /// bare E2BIG. Linux allows 128 KiB per environment entry.
+#[cfg(target_os = "linux")]
 const MAX_SPEC_BYTES: usize = 96 * 1024;
 
 /// Error building a sandbox policy

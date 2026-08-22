@@ -68,7 +68,11 @@ impl std::fmt::Display for NamespaceError {
     }
 }
 
-const ENABLE_USERNS_HINT: &str = "Enable unprivileged user namespaces     (`sysctl -w kernel.unprivileged_userns_clone=1`, or on Ubuntu     `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`)";
+const ENABLE_USERNS_HINT: &str = concat!(
+    "Enable unprivileged user namespaces ",
+    "(`sysctl -w kernel.unprivileged_userns_clone=1`, ",
+    "or on Ubuntu `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`)"
+);
 
 /// Restrict the calling process's network access for `mode`.
 ///
@@ -76,35 +80,69 @@ const ENABLE_USERNS_HINT: &str = "Enable unprivileged user namespaces     (`sysc
 pub fn apply(mode: NetworkMode) -> Result<Enforcement, String> {
     match mode {
         NetworkMode::Online => Ok(Enforcement::Unrestricted),
-        NetworkMode::Offline => match unshare_network(false) {
-            Ok(()) => Ok(Enforcement::Namespace { loopback: false }),
-            // A half-built namespace cannot be undone, and every later step
-            // would fail confusingly. Stop here instead of falling back.
-            Err(NamespaceError::Broken(e)) => Err(format!(
-                "network namespace was created but could not be configured ({e}). \
-                 Refusing to continue in a partially initialised namespace."
-            )),
-            Err(NamespaceError::Unavailable(ns_err)) => match block_inet_sockets() {
+        NetworkMode::Offline => {
+            if namespace_usable(false) {
+                return unshare_network(false)
+                    .map(|()| Enforcement::Namespace { loopback: false })
+                    .map_err(broken_namespace);
+            }
+            match block_inet_sockets() {
                 Ok(()) => Ok(Enforcement::Seccomp),
                 // Fail closed: never run an "offline" command with live network.
                 Err(seccomp_err) => Err(format!(
-                    "could not isolate the network: user namespace failed ({ns_err}) and the \
+                    "could not isolate the network: no usable network namespace and the \
                      seccomp fallback failed ({seccomp_err}). Refusing to run with network access."
                 )),
-            },
-        },
-        NetworkMode::Localhost => unshare_network(true)
-            .map(|()| Enforcement::Namespace { loopback: true })
-            .map_err(|e| match e {
-                NamespaceError::Broken(e) => format!(
-                    "network namespace was created but could not be configured ({e}). \
-                     Refusing to continue in a partially initialised namespace."
-                ),
-                NamespaceError::Unavailable(e) => format!(
-                    "localhost mode needs an unprivileged user namespace, which this system \
-                     refused ({e}). {ENABLE_USERNS_HINT}, or use --offline / --online instead."
-                ),
-            }),
+            }
+        }
+        NetworkMode::Localhost => {
+            if !namespace_usable(true) {
+                return Err(format!(
+                    "localhost mode needs a usable unprivileged user namespace, which this \
+                     system does not provide. {ENABLE_USERNS_HINT}, or use --offline / --online \
+                     instead."
+                ));
+            }
+            unshare_network(true)
+                .map(|()| Enforcement::Namespace { loopback: true })
+                .map_err(broken_namespace)
+        }
+    }
+}
+
+fn broken_namespace(e: NamespaceError) -> String {
+    format!(
+        "network namespace could not be set up ({e}). Refusing to continue in a partially \
+         initialised namespace."
+    )
+}
+
+/// Whether this system can give us a *fully configured* private network
+/// namespace, rehearsed in a throwaway child.
+///
+/// `unshare` cannot be undone, and creating the namespace is not the same as
+/// being allowed to configure it: some systems let the namespace be created and
+/// then refuse the credential mapping, which would strand the real process in a
+/// namespace where its own files are inaccessible. Committing only after the
+/// whole sequence has been shown to work keeps that state unreachable.
+///
+/// The caller must be single-threaded - both the CLI and the freshly exec'd
+/// launcher are - so the child may safely run ordinary Rust code before
+/// `_exit`.
+pub fn namespace_usable(loopback: bool) -> bool {
+    match unsafe { libc::fork() } {
+        -1 => false,
+        0 => {
+            let ok = unshare_network(loopback).is_ok();
+            unsafe { libc::_exit(i32::from(!ok)) }
+        }
+        pid => {
+            let mut status = 0;
+            if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+                return false;
+            }
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        }
     }
 }
 
@@ -195,28 +233,6 @@ fn bring_loopback_up() -> Result<(), NamespaceError> {
     };
     unsafe { libc::close(fd) };
     result.map_err(|e| NamespaceError::Broken(format!("failed to bring up loopback: {e}")))
-}
-
-/// Report whether an unprivileged user namespace can be created, without
-/// disturbing the calling process.
-///
-/// Forks a child that only calls `unshare` and `_exit`, so it stays
-/// async-signal-safe even if the caller has threads.
-pub fn user_namespace_available() -> bool {
-    match unsafe { libc::fork() } {
-        -1 => false,
-        0 => {
-            let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
-            unsafe { libc::_exit(if rc == 0 { 0 } else { 1 }) }
-        }
-        pid => {
-            let mut status = 0;
-            if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-                return false;
-            }
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
-        }
-    }
 }
 
 // --- seccomp fallback ---
@@ -323,6 +339,26 @@ mod tests {
         assert_eq!(
             apply(NetworkMode::Online).unwrap(),
             Enforcement::Unrestricted
+        );
+    }
+
+    /// The probe must leave the caller's own namespaces untouched, or every
+    /// later `sx` run would inherit a namespace it never asked for.
+    #[test]
+    fn probing_does_not_disturb_the_caller() {
+        let before = std::fs::read_to_string("/proc/self/ns/net").ok();
+        let interfaces_before = std::fs::read_to_string("/proc/net/dev").unwrap();
+
+        let first = namespace_usable(false);
+        let second = namespace_usable(true);
+
+        assert_eq!(first, namespace_usable(false), "probe is not deterministic");
+        assert_eq!(second, namespace_usable(true), "probe is not deterministic");
+        assert_eq!(before, std::fs::read_to_string("/proc/self/ns/net").ok());
+        assert_eq!(
+            interfaces_before,
+            std::fs::read_to_string("/proc/net/dev").unwrap(),
+            "probing changed the caller's network namespace"
         );
     }
 
