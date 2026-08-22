@@ -219,6 +219,7 @@ pub fn parse_spec(spec: &str) -> Result<SandboxParams, PolicyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::ffi::OsStr;
     use std::path::Path;
 
