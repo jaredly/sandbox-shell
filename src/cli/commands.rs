@@ -80,9 +80,17 @@ pub fn explain(args: &Args) -> Result<()> {
 
     // Denied read paths
     if !context.params.deny_read.is_empty() {
+        let shadowed = denies_shadowed_by_working_dir(&context.params);
         println!("Denied Read Paths:");
         for path in &context.params.deny_read {
-            println!("  - {}", path.display());
+            if shadowed.contains(&path) {
+                println!(
+                    "  - {}  (OVERRIDDEN by the working directory)",
+                    path.display()
+                );
+            } else {
+                println!("  - {}", path.display());
+            }
         }
         println!();
     }
@@ -163,6 +171,8 @@ pub fn execute(args: &Args) -> Result<()> {
         eprintln!("[sx] Profiles: {}", context.profile_names.join(", "));
         eprintln!("[sx] Working dir: {}", context.params.working_dir.display());
     }
+
+    warn_about_shadowed_denies(&context.params);
 
     let command: Vec<String> = args.command.clone().unwrap_or_default();
     let shell = context.config.sandbox.shell.as_deref();
@@ -369,6 +379,38 @@ fn build_sandbox_params(
     }
 }
 
+/// Denied paths that the working directory silently overrides.
+///
+/// The working directory is granted full access *after* the deny rules on both
+/// backends, so a deny that lives inside it has no effect. That is intentional
+/// (a project under `~/Documents` still has to build), but it also means
+/// running `sx` straight from `$HOME` quietly voids every deny. Worth saying
+/// out loud rather than letting the promise fail silently.
+fn denies_shadowed_by_working_dir(params: &SandboxParams) -> Vec<&PathBuf> {
+    if params.working_dir.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    params
+        .deny_read
+        .iter()
+        .filter(|deny| deny.starts_with(&params.working_dir))
+        .collect()
+}
+
+fn warn_about_shadowed_denies(params: &SandboxParams) {
+    let shadowed = denies_shadowed_by_working_dir(params);
+    if shadowed.is_empty() {
+        return;
+    }
+    let list: Vec<String> = shadowed.iter().map(|p| p.display().to_string()).collect();
+    eprintln!(
+        "\x1b[33m[sx:warn]\x1b[0m Working directory {} has full access, which overrides \
+         deny_read for: {}",
+        params.working_dir.display(),
+        list.join(", ")
+    );
+}
+
 /// Expand paths and drop duplicates, preserving order.
 ///
 /// Distinct entries can collapse onto the same path once symlinks are resolved:
@@ -533,6 +575,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deny_inside_the_working_directory_is_reported_as_shadowed() {
+        let params = SandboxParams {
+            working_dir: PathBuf::from("/home/u"),
+            deny_read: vec![
+                PathBuf::from("/home/u/.aws"),
+                PathBuf::from("/home/other/.aws"),
+            ],
+            ..Default::default()
+        };
+        let shadowed = denies_shadowed_by_working_dir(&params);
+        assert_eq!(shadowed, vec![&PathBuf::from("/home/u/.aws")]);
+    }
+
+    #[test]
+    fn denies_outside_the_working_directory_are_not_shadowed() {
+        let params = SandboxParams {
+            working_dir: PathBuf::from("/home/u/project"),
+            deny_read: vec![PathBuf::from("/home/u/.aws")],
+            ..Default::default()
+        };
+        assert!(denies_shadowed_by_working_dir(&params).is_empty());
+    }
+
+    #[test]
+    fn an_empty_working_directory_shadows_nothing() {
+        let params = SandboxParams {
+            deny_read: vec![PathBuf::from("/home/u/.aws")],
+            ..Default::default()
+        };
+        assert!(denies_shadowed_by_working_dir(&params).is_empty());
+    }
+
+    #[test]
     fn test_generate_config_template_is_valid_toml() {
         let template = generate_config_template();
         let result: Result<Config, _> = toml::from_str(template);
@@ -584,8 +659,10 @@ mod tests {
     #[test]
     fn test_determine_network_mode_profile_precedence() {
         let args = Args::try_parse_from(["sx"]).unwrap();
-        let mut profile = Profile::default();
-        profile.network_mode = Some(NetworkMode::Localhost);
+        let profile = Profile {
+            network_mode: Some(NetworkMode::Localhost),
+            ..Default::default()
+        };
         let config = Config::default();
 
         let mode = determine_network_mode(&args, &profile, &config);

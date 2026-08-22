@@ -43,6 +43,30 @@ Everything blocked unless explicitly allowed:
 
 Everything else (`~/.config/gh`, `~/.netrc`, `~/.gnupg`…) is blocked by deny-by-default. Use profiles like `gpg` to allow specific paths.
 
+#### The working directory is an exception
+
+The working directory gets full read/write access, and that grant is applied
+*after* the deny rules on both backends. A deny that lives inside it therefore
+has no effect. This is deliberate — a project under `~/Documents` still has to
+build — but it has a sharp edge:
+
+```bash
+cd ~ && sx        # working directory is $HOME, so every deny above is void
+```
+
+Run from `$HOME`, the sandbox no longer protects `~/.ssh` or `~/.aws` from the
+code it runs. `sx` prints a warning when this happens, and `sx --explain` marks
+the affected entries `(OVERRIDDEN by the working directory)`. Run `sx` from the
+project you actually want to sandbox, not from your home directory.
+
+#### `.sandbox.toml` is trusted input
+
+Project config is read from the working directory, which the sandbox grants
+write access to. Code running under `sx` can therefore rewrite `.sandbox.toml`
+and widen its own policy on the *next* run — the same trust you already extend
+to a `Makefile` or an npm `postinstall`. Review it like one, especially in
+repositories you did not write.
+
 ### Network Isolation
 
 | Mode | Effect |
@@ -75,6 +99,11 @@ Blocked by default:
 - `*_PASSWORD*`
 - `*_KEY`
 
+Dynamic-loader variables (`LD_*`, `DYLD_*`) are dropped unconditionally and
+cannot be re-added through `set_env`. They inject code into a process before its
+`main` runs — including the sandbox launcher itself, where a preloaded library
+could stop the policy from being applied at all.
+
 ## Linux Enforcement
 
 Linux has no single mechanism equivalent to Seatbelt, so `sx` composes two.
@@ -96,6 +125,15 @@ unhandled, which keeps device ioctls implicitly allowed and mirrors Seatbelt's
 global `(allow file-ioctl)` — without it, terminal control breaks. Signal
 scoping (ABI 6) is requested, matching Seatbelt's `(allow signal (target self))`.
 
+### Handing the policy to the launcher
+
+The launcher receives the policy through its environment, set by `sx` at
+`execve` time. It is deliberately not a file: the sandbox grants write access to
+`/tmp`, so a policy file there could be swapped by a concurrent sandboxed
+process between the moment `sx` writes it and the moment the launcher reads it.
+An environment set by the parent has no such window. The launcher clears the
+variable before `exec`, so the sandboxed program never sees it.
+
 ### Emulating `deny_read`
 
 Landlock is **allow-list only**: it has no deny rules and no last-match-wins
@@ -111,6 +149,20 @@ allow_read = ["~"], deny_read = ["~/.aws"]
 ```
 
 A directory that cannot be enumerated contributes no rules — it fails closed.
+
+Two details that matter for correctness:
+
+- **Symlinks are resolved before a rule is written.** Landlock registers rules
+  against the inode a path resolves to, so a link named outside a denied subtree
+  would otherwise hand that subtree straight back.
+- **A `deny_read` glob keeps its directory carved even when it matches nothing
+  yet.** Patterns are resolved once, so a directory containing a deny pattern is
+  always expanded entry by entry; a file created afterwards falls outside every
+  rule instead of inheriting a broad grant.
+
+A consequence of Landlock's design: a symlink *inside* an allowed directory that
+points outside it is not reachable, because the target is not beneath any rule.
+Allow the target path explicitly if you need it.
 
 ### Network: namespaces, or seccomp
 
