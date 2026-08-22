@@ -241,10 +241,15 @@ fn test_builtin_profile_opencode() {
         .filesystem
         .allow_read
         .contains(&"~/.cache/opencode".to_string()));
+    // The macOS per-session temp dir is declared under [platform.macos] and is
+    // folded in only when building for macOS.
+    #[cfg(target_os = "macos")]
     assert!(profile
         .filesystem
         .allow_list_dirs
         .contains(&"/private/tmp".to_string()));
+    #[cfg(not(target_os = "macos"))]
+    assert!(profile.filesystem.allow_list_dirs.is_empty());
     assert!(profile
         .filesystem
         .allow_write

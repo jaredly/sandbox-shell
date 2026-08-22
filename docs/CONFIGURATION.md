@@ -10,7 +10,8 @@ Your personal paths. Terminal, shell prompt, directory jumper…
 [sandbox]
 default_network = "offline"      # offline | online | localhost
 default_profiles = ["base"]      # always include these
-shell = "/bin/zsh"               # shell inside sandbox
+shell = "/bin/zsh"               # shell inside sandbox (defaults to $SHELL,
+                                 # then /bin/zsh on macOS, /bin/bash on Linux)
 prompt_indicator = true          # show [sx:mode] in prompt
 inherit_base = true              # include base profile
 # allow_exec_sugid = ["/bin/ps"] # allow specific setuid/setgid binaries
@@ -24,7 +25,7 @@ allow_read = [
     # zoxide
     "~/.local/share/zoxide/",
 
-    # Ghostty users - required or terminal breaks
+    # Ghostty users - required or terminal breaks (macOS path shown)
     "/Applications/Ghostty.app/Contents/Resources/terminfo",
 ]
 allow_write = [
@@ -135,3 +136,24 @@ sx --allow-exec-sugid /bin/ps --allow-exec-sugid /usr/bin/newgrp -- ps aux
 - `AWS_*` - matches `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`…
 - `*_SECRET*` - matches `DATABASE_SECRET`, `MY_SECRET_KEY`…
 - `*_KEY` - matches `API_KEY`, `SSH_KEY`…
+
+## Per-OS Configuration
+
+The config format is identical on macOS and Linux, but the paths are not. Custom
+**profiles** support `[platform.macos]` / `[platform.linux]` sections for paths
+that only exist on one OS — see [PROFILES.md](PROFILES.md#per-os-sections).
+
+For machine-specific paths in your global config, the simplest approach is to
+keep the config next to the machine it describes: `~/.config/sx/config.toml` is
+not shared between your Mac and your Linux box.
+
+Settings that behave differently per platform:
+
+| Setting | Note |
+|---------|------|
+| `allow_exec_sugid` | macOS only; on Linux setuid binaries never elevate |
+| `[seatbelt] raw` | macOS only; ignored on Linux |
+| `allow_list_dirs` | macOS lists exactly the named directory; Linux also lists nested directories (names only) |
+| `deny_read` | on Linux, denies file contents; names may remain listable via a readable parent |
+
+Run `sx --explain` to see exactly what the current machine will enforce.

@@ -1,6 +1,7 @@
 # Security Model
 
-`sx` uses macOS Seatbelt (`sandbox-exec`) to isolate processes. Deny-by-default.
+`sx` isolates processes with the sandbox the kernel already provides — Seatbelt
+(`sandbox-exec`) on macOS, Landlock on Linux. Deny-by-default on both.
 
 ## Threat Model
 
@@ -74,6 +75,93 @@ Blocked by default:
 - `*_PASSWORD*`
 - `*_KEY`
 
+## Linux Enforcement
+
+Linux has no single mechanism equivalent to Seatbelt, so `sx` composes two.
+
+### Filesystem: Landlock
+
+Landlock is an unprivileged, per-process LSM policy that survives `exec` and is
+inherited by every descendant. Like Seatbelt — and unlike a mount namespace — it
+does not change the filesystem *view*: denied paths still exist and return
+`EACCES`, so error messages stay recognisable.
+
+`sx` refuses to run if the kernel reports that Landlock was not enforced. A
+sandbox that silently does not sandbox is worse than no sandbox.
+
+Access rights are requested at ABI 3 (the v1 file rights plus `Refer` for
+cross-directory renames and `Truncate`), on a best-effort basis so older kernels
+still get everything they support. `IoctlDev` (ABI 5) is deliberately left
+unhandled, which keeps device ioctls implicitly allowed and mirrors Seatbelt's
+global `(allow file-ioctl)` — without it, terminal control breaks. Signal
+scoping (ABI 6) is requested, matching Seatbelt's `(allow signal (target self))`.
+
+### Emulating `deny_read`
+
+Landlock is **allow-list only**: it has no deny rules and no last-match-wins
+ordering. `sx` emulates denies by *subtraction* — when an allowed hierarchy
+contains a denied path, the hierarchy is expanded into its siblings so the
+denied subtree simply never receives a rule.
+
+```
+allow_read = ["~"], deny_read = ["~/.aws"]
+
+  becomes rules for  ~/projects, ~/.bashrc, ~/dev, ...   (everything but ~/.aws)
+  plus listing on    ~
+```
+
+A directory that cannot be enumerated contributes no rules — it fails closed.
+
+### Network: namespaces, or seccomp
+
+Landlock only gained TCP controls in ABI 4, and they filter by port rather than
+address, so they cannot express `sx`'s network modes. Network isolation uses
+namespaces instead:
+
+| Mode | Mechanism |
+|------|-----------|
+| `online` | no restriction |
+| `offline` | empty network namespace; seccomp rejecting `AF_INET`/`AF_INET6`/`AF_PACKET` sockets where unprivileged user namespaces are blocked |
+| `localhost` | network namespace with its own loopback interface |
+
+If neither mechanism can be applied, `sx` refuses to run rather than execute an
+"offline" command with live network access.
+
+### Setuid on Linux
+
+Unprivileged Landlock requires `no_new_privs`, so a setuid binary executed
+inside the sandbox never elevates. This is stricter than the macOS default, and
+it means `allow_exec_sugid` has no effect on Linux — `--dry-run` and `--explain`
+say so when it is configured.
+
+## Platform Differences
+
+Same CLI, same config, same deny-by-default model. These behaviours differ:
+
+| Behaviour | macOS | Linux |
+|-----------|-------|-------|
+| `deny_read` and directory listings | names and contents both denied | contents denied; **names may still be listable** when a parent grants listing, because Landlock rules are always hierarchical |
+| `localhost` network | filters the *host* loopback, so a sandboxed server is reachable from the host | the sandbox gets its **own private loopback**; sandboxed processes reach each other, host-local services stay out of reach (strictly tighter, but a real difference) |
+| Glob paths (`/tmp/foo*`) | matched at access time | resolved once when the policy is built; paths created later do not match |
+| `allow_list_dirs` | exactly the named directory | the directory and everything beneath it (names only) |
+| `allow_exec_sugid` | per-binary opt-in | no effect; setuid never elevates |
+| Raw `[seatbelt]` rules | applied | ignored |
+| Supplementary groups | unchanged | dropped in `offline`/`localhost`, because entering a user namespace maps only your own uid/gid |
+| `--trace` | streams denials from the unified log | unavailable; Landlock denials only reach the kernel audit log, which needs privileges. Use `--dry-run` / `--explain` instead |
+
+### `/proc` exposure on Linux
+
+The Linux base profile grants read access to `/proc`, which most runtimes
+require. That also exposes `/proc/<pid>/environ` and `/proc/<pid>/cmdline` for
+**your own other processes**, so secrets exported into an unrelated shell are
+readable from inside the sandbox.
+
+This is comparable to macOS, where the profile grants `(allow sysctl-read)`.
+Narrowing it needs a PID namespace with a private `/proc` mount, which is a
+container-shaped change and is not done today. If it matters to you, avoid
+exporting long-lived secrets into your interactive shell environment, or drop
+`/proc` from `allow_read` and add back the specific files your tools need.
+
 ## Generated Seatbelt Profile
 
 ```scheme
@@ -110,16 +198,39 @@ Blocked by default:
 ; online: (allow network*)
 ```
 
+## Generated Landlock Policy
+
+`sx --dry-run` prints the resolved rule set, the network plan for this machine,
+and the paths that were denied:
+
+```
+# sx sandbox policy (landlock)
+# kernel Landlock ABI: 6
+# network: offline -> private network namespace
+# setuid/setgid execution: never elevates (no_new_privs is always set)
+
+# denied for reading (no rule is emitted for these paths)
+# deny /home/me/.aws
+
+# r = read files + execute, l = list directory, w = create/modify/delete
+rl- /usr
+rl- /proc
+rlw /home/me/project
+r-w /dev/null
+```
+
 ## Limitations
 
 1. **Root bypass** - Root can escape any sandbox
 2. **Kernel bugs** - Sandbox depends on kernel security
 3. **Side channels** - Timing attacks not prevented
 4. **Existing processes** - Only affects new processes
+5. **Same-user process introspection** (Linux) - see [`/proc` exposure](#proc-exposure-on-linux)
 
 ## Best Practices
 
 1. Default to `offline` unless network required
 2. Use `localhost` for dev servers
 3. Review custom profiles before trusting them
-4. Use `--trace` to debug denials
+4. Use `--trace` to debug denials (macOS), or `--dry-run` / `--explain` (both)
+5. On Linux, check `sx --explain` reports a Landlock ABI — if it does not, the kernel cannot enforce the sandbox
