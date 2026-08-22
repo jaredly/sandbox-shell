@@ -48,6 +48,28 @@ impl std::fmt::Display for Enforcement {
     }
 }
 
+/// Why a network namespace could not be used.
+#[derive(Debug)]
+enum NamespaceError {
+    /// `unshare` itself was refused. The process is untouched, so falling back
+    /// to another mechanism is safe.
+    Unavailable(String),
+    /// The namespace was created but could not be configured. The process is
+    /// now in a half-built namespace with unmapped credentials, so there is
+    /// nothing safe to fall back to.
+    Broken(String),
+}
+
+impl std::fmt::Display for NamespaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NamespaceError::Unavailable(e) | NamespaceError::Broken(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+const ENABLE_USERNS_HINT: &str = "Enable unprivileged user namespaces     (`sysctl -w kernel.unprivileged_userns_clone=1`, or on Ubuntu     `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`)";
+
 /// Restrict the calling process's network access for `mode`.
 ///
 /// Must run in a single-threaded process: `unshare(CLONE_NEWUSER)` requires it.
@@ -56,7 +78,13 @@ pub fn apply(mode: NetworkMode) -> Result<Enforcement, String> {
         NetworkMode::Online => Ok(Enforcement::Unrestricted),
         NetworkMode::Offline => match unshare_network(false) {
             Ok(()) => Ok(Enforcement::Namespace { loopback: false }),
-            Err(ns_err) => match block_inet_sockets() {
+            // A half-built namespace cannot be undone, and every later step
+            // would fail confusingly. Stop here instead of falling back.
+            Err(NamespaceError::Broken(e)) => Err(format!(
+                "network namespace was created but could not be configured ({e}). \
+                 Refusing to continue in a partially initialised namespace."
+            )),
+            Err(NamespaceError::Unavailable(ns_err)) => match block_inet_sockets() {
                 Ok(()) => Ok(Enforcement::Seccomp),
                 // Fail closed: never run an "offline" command with live network.
                 Err(seccomp_err) => Err(format!(
@@ -67,26 +95,33 @@ pub fn apply(mode: NetworkMode) -> Result<Enforcement, String> {
         },
         NetworkMode::Localhost => unshare_network(true)
             .map(|()| Enforcement::Namespace { loopback: true })
-            .map_err(|e| {
-                format!(
+            .map_err(|e| match e {
+                NamespaceError::Broken(e) => format!(
+                    "network namespace was created but could not be configured ({e}). \
+                     Refusing to continue in a partially initialised namespace."
+                ),
+                NamespaceError::Unavailable(e) => format!(
                     "localhost mode needs an unprivileged user namespace, which this system \
-                     refused ({e}). Enable it (`sysctl -w kernel.unprivileged_userns_clone=1`, or \
-                     on Ubuntu `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`) or use \
-                     --offline / --online instead."
-                )
+                     refused ({e}). {ENABLE_USERNS_HINT}, or use --offline / --online instead."
+                ),
             }),
     }
 }
 
 /// Enter a private user + network namespace.
-fn unshare_network(loopback: bool) -> Result<(), String> {
+fn unshare_network(loopback: bool) -> Result<(), NamespaceError> {
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
 
     if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(NamespaceError::Unavailable(
+            io::Error::last_os_error().to_string(),
+        ));
     }
 
+    // Past this point the namespace exists and cannot be left, so every failure
+    // is Broken rather than Unavailable.
+    //
     // Map our own credentials 1:1 so files keep their normal ownership. The
     // kernel allows an unprivileged single-entry map for the caller's own uid;
     // `setgroups` must be denied before gid_map may be written.
@@ -100,8 +135,9 @@ fn unshare_network(loopback: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn write_proc(path: &str, value: &str) -> Result<(), String> {
-    std::fs::write(path, value).map_err(|e| format!("failed to write {path}: {e}"))
+fn write_proc(path: &str, value: &str) -> Result<(), NamespaceError> {
+    std::fs::write(path, value)
+        .map_err(|e| NamespaceError::Broken(format!("failed to write {path}: {e}")))
 }
 
 // SIOCGIFFLAGS / SIOCSIFFLAGS are stable Linux ioctl numbers.
@@ -109,6 +145,11 @@ const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
 const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
 
 /// `struct ifreq`, spelled out so it does not depend on libc's union layout.
+///
+/// `ifr_name` is 16 bytes on every Linux ABI and the union follows it, so the
+/// flags always sit at offset 16. The tail is padded to the 64-bit union size;
+/// being at least as large as the kernel's struct is what matters, since the
+/// kernel copies a fixed number of bytes in.
 #[repr(C)]
 struct IfReq {
     name: [libc::c_char; 16],
@@ -116,17 +157,19 @@ struct IfReq {
     _union_pad: [u8; 22],
 }
 
+const _: () = assert!(std::mem::size_of::<IfReq>() >= 40);
+
 /// Bring `lo` up inside the new namespace.
 ///
 /// We hold CAP_NET_ADMIN over this namespace because we created the user
 /// namespace that owns it.
-fn bring_loopback_up() -> Result<(), String> {
+fn bring_loopback_up() -> Result<(), NamespaceError> {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
-        return Err(format!(
+        return Err(NamespaceError::Broken(format!(
             "failed to open control socket: {}",
             io::Error::last_os_error()
-        ));
+        )));
     }
 
     let mut req = IfReq {
@@ -151,7 +194,7 @@ fn bring_loopback_up() -> Result<(), String> {
         }
     };
     unsafe { libc::close(fd) };
-    result.map_err(|e| format!("failed to bring up loopback: {e}"))
+    result.map_err(|e| NamespaceError::Broken(format!("failed to bring up loopback: {e}")))
 }
 
 /// Report whether an unprivileged user namespace can be created, without
@@ -205,20 +248,34 @@ const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
 ///
 /// Coarser than a network namespace - it cannot distinguish loopback - but it
 /// needs no namespace support, which is what makes it a usable fallback.
+///
+/// `io_uring_setup` is refused as well: io_uring can open and connect sockets
+/// through submission queue entries, which never pass through `socket(2)` and
+/// so are invisible to a syscall filter. Blocking the ring at creation closes
+/// that path; programs treat `ENOSYS` as "no io_uring here" and fall back.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn block_inet_sockets() -> Result<(), String> {
-    let deny = SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32 & 0xffff);
+    let no_inet = SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32 & 0xffff);
+    let no_ring = SECCOMP_RET_ERRNO | (libc::ENOSYS as u32 & 0xffff);
+
+    // Jump offsets are relative to the *next* instruction.
     let filter = [
+        // 0: reject anything running under a different syscall ABI outright.
         insn(BPF_LD_W_ABS, 0, 0, OFF_ARCH),
         insn(BPF_JMP_JEQ_K, 1, 0, AUDIT_ARCH),
         insn(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        // 3: dispatch on the syscall number.
         insn(BPF_LD_W_ABS, 0, 0, OFF_NR),
-        insn(BPF_JMP_JEQ_K, 0, 5, libc::SYS_socket as u32),
+        insn(BPF_JMP_JEQ_K, 5, 0, libc::SYS_io_uring_setup as u32), // -> no_ring
+        insn(BPF_JMP_JEQ_K, 0, 6, libc::SYS_socket as u32),         // else -> allow
+        // 6: socket(2) - inspect the address family.
         insn(BPF_LD_W_ABS, 0, 0, OFF_ARG0),
-        insn(BPF_JMP_JEQ_K, 2, 0, libc::AF_INET as u32),
-        insn(BPF_JMP_JEQ_K, 1, 0, libc::AF_INET6 as u32),
-        insn(BPF_JMP_JEQ_K, 0, 1, libc::AF_PACKET as u32),
-        insn(BPF_RET_K, 0, 0, deny),
+        insn(BPF_JMP_JEQ_K, 3, 0, libc::AF_INET as u32),
+        insn(BPF_JMP_JEQ_K, 2, 0, libc::AF_INET6 as u32),
+        insn(BPF_JMP_JEQ_K, 1, 2, libc::AF_PACKET as u32),
+        // 10: verdicts.
+        insn(BPF_RET_K, 0, 0, no_ring),
+        insn(BPF_RET_K, 0, 0, no_inet),
         insn(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
     ];
 
@@ -280,9 +337,11 @@ mod tests {
 
     /// Verifies the BPF program in a throwaway child: the filter is
     /// irreversible, so it cannot be installed in the test process itself.
+    ///
+    /// Exit codes identify which check failed (see the match arms below).
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
-    fn seccomp_fallback_blocks_inet_but_keeps_unix() {
+    fn seccomp_fallback_blocks_network_paths_but_keeps_unix() {
         let mut status = 0;
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
@@ -291,11 +350,28 @@ mod tests {
                 Err(_) => 10,
                 Ok(()) => {
                     let inet = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+                    let inet6 = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
                     let unix = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-                    match (inet < 0, unix >= 0) {
-                        (true, true) => 0,
-                        (false, _) => 11, // AF_INET was allowed through
-                        (_, false) => 12, // AF_UNIX was wrongly blocked
+                    let ring = unsafe {
+                        libc::syscall(
+                            libc::SYS_io_uring_setup,
+                            1,
+                            std::ptr::null::<libc::c_void>(),
+                        )
+                    };
+                    let ring_blocked =
+                        ring < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS);
+
+                    if inet >= 0 {
+                        11 // AF_INET was allowed through
+                    } else if inet6 >= 0 {
+                        12 // AF_INET6 was allowed through
+                    } else if unix < 0 {
+                        13 // AF_UNIX was wrongly blocked
+                    } else if !ring_blocked {
+                        14 // io_uring could still be set up
+                    } else {
+                        0
                     }
                 }
             };
