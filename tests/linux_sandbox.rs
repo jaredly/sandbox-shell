@@ -429,12 +429,38 @@ fn the_sandbox_helper_refuses_incomplete_invocations() {
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("usage"));
 
+    // Without the policy in the environment there is nothing to enforce, so the
+    // helper must refuse rather than exec the command unsandboxed.
     let out = Command::new(SX_BIN)
-        .args(["--sandbox-apply", "/nonexistent/spec.toml", "/usr/bin/true"])
+        .args(["--sandbox-apply", "/usr/bin/true"])
+        .env_remove("SX_SANDBOX_SPEC")
+        .output()
+        .expect("failed to run sx");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("SX_SANDBOX_SPEC"));
+
+    let out = Command::new(SX_BIN)
+        .args(["--sandbox-apply", "/usr/bin/true"])
+        .env("SX_SANDBOX_SPEC", "this is not valid toml {{{")
         .output()
         .expect("failed to run sx");
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("sandbox spec"));
+}
+
+/// The policy must not leak into the sandboxed program's environment, and it
+/// must not be handed over through a file the sandbox itself can write to.
+#[test]
+fn the_policy_is_not_visible_to_the_sandboxed_program() {
+    require_landlock!();
+    let root = workspace();
+
+    let out = sx(root.path(), &["--", "/usr/bin/env"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("SX_SANDBOX_SPEC"),
+        "the sandboxed program inherited the policy"
+    );
 }
 
 /// Interface names from a `/proc/net/dev` dump, in file order.

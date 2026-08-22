@@ -10,26 +10,31 @@
 //! monotonically and namespaces only remove access - so it is safe for a
 //! sandboxed process to invoke it again.
 
-use crate::sandbox::backend;
+use crate::sandbox::backend::{self, SPEC_ENV};
 use crate::sandbox::executor::exit_codes;
 use crate::sandbox::linux::{landlock, net, rules};
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::process::Command;
 
-/// Apply the sandbox described by `args[0]`, then exec `args[1..]`.
+/// Apply the sandbox described by `$SX_SANDBOX_SPEC`, then exec `command`.
 ///
 /// Never returns on success: the process is replaced by the target command.
-pub fn run(args: &[OsString]) -> ! {
-    let Some((spec_path, command)) = args.split_first() else {
-        fail("usage: sx --sandbox-apply <spec> <command> [args...]");
-    };
+pub fn run(command: &[OsString]) -> ! {
     if command.is_empty() {
-        fail("no command given to run inside the sandbox");
+        fail("usage: sx --sandbox-apply <command> [args...]");
     }
 
-    let params = match backend::load_spec(Path::new(spec_path)) {
+    let Ok(spec) = std::env::var(SPEC_ENV) else {
+        fail(&format!(
+            "{SPEC_ENV} is not set; --sandbox-apply is internal to sx and is not meant to be \
+             invoked directly"
+        ));
+    };
+    // Drop it before exec so the sandboxed program never inherits the policy.
+    std::env::remove_var(SPEC_ENV);
+
+    let params = match backend::parse_spec(&spec) {
         Ok(params) => params,
         Err(e) => fail(&format!("could not read sandbox spec: {e}")),
     };

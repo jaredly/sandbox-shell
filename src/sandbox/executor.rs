@@ -134,7 +134,7 @@ pub fn execute_sandboxed_with_trace(
 ) -> Result<ExecutionResult, ExecutionError> {
     let mut trace_session = start_trace(trace, trace_file);
 
-    // Build the platform sandbox launcher. `_launch` owns the policy file and
+    // Build the platform sandbox launcher. `launch` owns any policy file and
     // must outlive the child that reads it.
     let launch = backend::prepare(params)?;
     let mut cmd = Command::new(&launch.program);
@@ -142,6 +142,11 @@ pub fn execute_sandboxed_with_trace(
 
     // Apply environment filtering (clears env, then selectively passes through)
     apply_env_filter(&mut cmd, params);
+
+    // Launcher variables go on after filtering so they are not stripped.
+    for (key, value) in &launch.launcher_env {
+        cmd.env(key, value);
+    }
 
     // Set SANDBOX_MODE environment variable for shell prompt integration
     let mode_str = match params.network_mode {
@@ -231,6 +236,9 @@ pub fn execute_sandboxed_captured(
 
     // Apply environment filtering
     apply_env_filter(&mut cmd, params);
+    for (key, value) in &launch.launcher_env {
+        cmd.env(key, value);
+    }
 
     cmd.args(command);
 
@@ -403,17 +411,29 @@ fn matches_env_pattern(name: &str, patterns: &[String]) -> bool {
     false
 }
 
+/// Variables the dynamic loader uses to inject code into a process.
+///
+/// These are dropped unconditionally - they are never forwarded and cannot be
+/// re-added through `set_env`. The sandbox launcher is itself a process, so a
+/// preloaded library would run inside it *before* the policy is applied and
+/// could stop the sandbox from being enforced at all. `pass_env` normally
+/// filters them out as an allow-list, but it is empty when a project sets
+/// `inherit_base = false`, which is exactly when this matters.
+fn is_loader_injection_var(key: &str) -> bool {
+    // DYLD_* is the macOS loader, LD_* the glibc/musl one. Both lists are
+    // applied everywhere so behaviour does not depend on the build target.
+    key.starts_with("DYLD_") || key.starts_with("LD_")
+}
+
 /// Apply environment filtering to a Command.
 /// Clears all env, then selectively passes through allowed vars.
 fn apply_env_filter(cmd: &mut Command, params: &SandboxParams) {
-    const DANGEROUS_PREFIXES: &[&str] = &["DYLD_"];
-
     cmd.env_clear();
 
     let parent_env: std::collections::HashMap<String, String> = std::env::vars().collect();
 
     for (key, value) in &parent_env {
-        if DANGEROUS_PREFIXES.iter().any(|p| key.starts_with(p)) {
+        if is_loader_injection_var(key) {
             continue;
         }
         if matches_env_pattern(key, &params.deny_env) {
@@ -425,7 +445,7 @@ fn apply_env_filter(cmd: &mut Command, params: &SandboxParams) {
     }
 
     for (key, value) in &params.set_env {
-        if DANGEROUS_PREFIXES.iter().any(|p| key.starts_with(p)) {
+        if is_loader_injection_var(key) {
             continue;
         }
         if matches_env_pattern(key, &params.deny_env) {
@@ -490,6 +510,20 @@ mod tests {
 
         let policy = dry_run(&params).unwrap();
         assert!(policy.contains("/tmp/test\"injection"));
+    }
+
+    #[test]
+    fn loader_injection_vars_are_always_dropped() {
+        assert!(is_loader_injection_var("LD_PRELOAD"));
+        assert!(is_loader_injection_var("LD_LIBRARY_PATH"));
+        assert!(is_loader_injection_var("LD_AUDIT"));
+        assert!(is_loader_injection_var("DYLD_INSERT_LIBRARIES"));
+        assert!(is_loader_injection_var("DYLD_LIBRARY_PATH"));
+
+        // Ordinary variables that merely start with the same letters stay.
+        assert!(!is_loader_injection_var("LDFLAGS"));
+        assert!(!is_loader_injection_var("PATH"));
+        assert!(!is_loader_injection_var("HOME"));
     }
 
     #[test]

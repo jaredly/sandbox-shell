@@ -4,10 +4,10 @@
 //! private temp file, and launches the target command through a helper that
 //! applies the policy before `exec`.
 //!
-//! | Platform | Helper | Policy language |
-//! |----------|--------|-----------------|
-//! | macOS    | `/usr/bin/sandbox-exec` | Seatbelt profile |
-//! | Linux    | `sx --sandbox-apply` (this binary) | serialised `SandboxParams`, enforced with Landlock |
+//! | Platform | Helper | Policy language | Handoff |
+//! |----------|--------|-----------------|---------|
+//! | macOS    | `/usr/bin/sandbox-exec` | Seatbelt profile | temp file (`-f`) |
+//! | Linux    | `sx --sandbox-apply` (this binary) | serialised `SandboxParams`, enforced with Landlock | child environment |
 //!
 //! Both implementations are compiled on every platform so they stay
 //! type-checked everywhere; only the selection below is target-specific.
@@ -22,6 +22,19 @@ use tempfile::NamedTempFile;
 
 /// Hidden argument that puts `sx` into "apply sandbox then exec" mode.
 pub const APPLY_FLAG: &str = "--sandbox-apply";
+
+/// Environment variable carrying the serialised policy to the helper.
+///
+/// Deliberately not a file. The sandbox grants write access to `/tmp`, so a
+/// policy file there can be swapped by a concurrent sandboxed process between
+/// the moment `sx` writes it and the moment the helper reads it. The child's
+/// environment is set by the parent at `execve` time and cannot be altered by
+/// anyone else, which removes the window rather than narrowing it.
+pub const SPEC_ENV: &str = "SX_SANDBOX_SPEC";
+
+/// Refuse specs that would not survive `execve`, rather than failing with a
+/// bare E2BIG. Linux allows 128 KiB per environment entry.
+const MAX_SPEC_BYTES: usize = 96 * 1024;
 
 /// Error building a sandbox policy
 #[derive(Debug)]
@@ -57,13 +70,15 @@ impl From<io::Error> for PolicyError {
 
 /// A prepared sandbox launcher.
 ///
-/// `program` + `args` are prepended to the user's command; the policy temp file
+/// `program` + `args` are prepended to the user's command, and `launcher_env`
+/// is applied to the child *after* environment filtering. Any policy temp file
 /// is owned here and must outlive the child process that reads it.
 #[derive(Debug)]
 pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<OsString>,
-    _policy: NamedTempFile,
+    pub launcher_env: Vec<(OsString, OsString)>,
+    _policy: Option<NamedTempFile>,
 }
 
 /// Human-readable name of the active enforcement mechanism.
@@ -150,23 +165,20 @@ fn prepare_seatbelt(params: &SandboxParams) -> Result<Launch, PolicyError> {
     Ok(Launch {
         program: PathBuf::from("/usr/bin/sandbox-exec"),
         args: vec![OsString::from("-f"), policy.path().into()],
-        _policy: policy,
+        launcher_env: Vec::new(),
+        _policy: Some(policy),
     })
 }
 
 // --- Linux (Landlock) ---
 
 /// Serialise the resolved parameters for the helper process.
-///
-/// The helper re-execs this same binary, so the policy crosses the process
-/// boundary as a file rather than as `argv` (which is world-readable) or an
-/// env var (which the sandboxed program would inherit).
 #[cfg(target_os = "linux")]
 fn prepare_landlock(params: &SandboxParams) -> Result<Launch, PolicyError> {
     // Strip everything the helper does not need. Environment filtering is
     // applied by the parent to the child's `Command`, so carrying `set_env`
-    // values into a file under /tmp would put configured secrets on disk for
-    // no benefit. Raw seatbelt rules are macOS-only.
+    // values across would expose configured secrets in the helper's
+    // /proc/<pid>/environ for no benefit. Raw seatbelt rules are macOS-only.
     let mut spec = params.clone();
     spec.pass_env.clear();
     spec.deny_env.clear();
@@ -175,29 +187,37 @@ fn prepare_landlock(params: &SandboxParams) -> Result<Launch, PolicyError> {
 
     let spec = toml::to_string(&spec)
         .map_err(|e| PolicyError::Invalid(format!("failed to serialise sandbox spec: {}", e)))?;
-    let policy = NamedTempFile::new()?;
-    fs::write(policy.path(), &spec)?;
 
-    let program = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+    if spec.len() > MAX_SPEC_BYTES {
+        return Err(PolicyError::Invalid(format!(
+            "sandbox policy is too large to hand to the launcher ({} bytes, limit {}). \
+             Reduce the number of allowed paths.",
+            spec.len(),
+            MAX_SPEC_BYTES
+        )));
+    }
 
+    // /proc/self/exe rather than current_exe(): it always resolves to the
+    // running image, even if the binary was replaced or unlinked underneath us,
+    // and it cannot be swapped between resolving the path and exec'ing it.
     Ok(Launch {
-        program,
-        args: vec![OsString::from(APPLY_FLAG), policy.path().into()],
-        _policy: policy,
+        program: PathBuf::from("/proc/self/exe"),
+        args: vec![OsString::from(APPLY_FLAG)],
+        launcher_env: vec![(OsString::from(SPEC_ENV), OsString::from(spec))],
+        _policy: None,
     })
 }
 
-/// Parse a spec file written by [`prepare`].
+/// Parse a serialised spec produced by [`prepare`].
 #[cfg(target_os = "linux")]
-pub fn load_spec(path: &std::path::Path) -> Result<SandboxParams, PolicyError> {
-    let content = fs::read_to_string(path)?;
-    toml::from_str(&content)
-        .map_err(|e| PolicyError::Invalid(format!("invalid sandbox spec: {}", e)))
+pub fn parse_spec(spec: &str) -> Result<SandboxParams, PolicyError> {
+    toml::from_str(spec).map_err(|e| PolicyError::Invalid(format!("invalid sandbox spec: {}", e)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::path::Path;
 
     fn sample() -> SandboxParams {
@@ -241,14 +261,48 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn landlock_launcher_reexecs_this_binary_with_a_readable_spec() {
-        let launch = prepare_landlock(&sample()).unwrap();
-        assert_eq!(launch.args[0], OsString::from(APPLY_FLAG));
+    fn spec_of(launch: &Launch) -> SandboxParams {
+        let (_, value) = launch
+            .launcher_env
+            .iter()
+            .find(|(k, _)| k == OsStr::new(SPEC_ENV))
+            .expect("launcher carries the spec");
+        parse_spec(value.to_str().unwrap()).unwrap()
+    }
 
-        let spec = load_spec(Path::new(&launch.args[1])).unwrap();
+    /// The policy never touches the filesystem: a file under /tmp could be
+    /// swapped by a concurrent sandboxed process before the helper reads it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_launcher_passes_the_spec_through_the_environment() {
+        let launch = prepare_landlock(&sample()).unwrap();
+        assert_eq!(launch.args, vec![OsString::from(APPLY_FLAG)]);
+        assert!(
+            launch
+                .args
+                .iter()
+                .all(|a| !a.to_str().unwrap().contains("/tmp")),
+            "spec path leaked into argv"
+        );
+
+        let spec = spec_of(&launch);
         assert_eq!(spec.working_dir, PathBuf::from("/tmp/project"));
         assert_eq!(spec.allow_read, vec![PathBuf::from("/usr")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_specs_are_rejected_before_exec() {
+        let params = SandboxParams {
+            allow_read: (0..20_000)
+                .map(|i| PathBuf::from(format!("/some/reasonably/long/path/number/{i}")))
+                .collect(),
+            ..sample()
+        };
+        assert!(matches!(
+            prepare_landlock(&params),
+            Err(PolicyError::Invalid(_))
+        ));
     }
 
     /// The helper needs the policy, not the environment: env filtering happens
@@ -267,10 +321,10 @@ mod tests {
         };
         let launch = prepare_landlock(&params).unwrap();
 
-        let raw = fs::read_to_string(&launch.args[1]).unwrap();
-        assert!(!raw.contains("s3cret"), "spec file leaked a set_env value");
+        let raw = format!("{:?}", launch.launcher_env);
+        assert!(!raw.contains("s3cret"), "spec leaked a set_env value");
 
-        let back = load_spec(Path::new(&launch.args[1])).unwrap();
+        let back = spec_of(&launch);
         assert!(back.set_env.is_empty());
         assert!(back.pass_env.is_empty());
         assert!(back.deny_env.is_empty());
@@ -295,7 +349,7 @@ mod tests {
             set_env: Default::default(),
         };
         let launch = prepare_landlock(&params).unwrap();
-        let back = load_spec(Path::new(&launch.args[1])).unwrap();
+        let back = spec_of(&launch);
 
         assert_eq!(back.working_dir, params.working_dir);
         assert_eq!(back.home_dir, params.home_dir);
