@@ -46,7 +46,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        # --all-targets so tests and benches are linted too, not just the crate.
+        run: cargo clippy --all-targets -- -D warnings
 
   build:
     runs-on: ${{ matrix.os }}

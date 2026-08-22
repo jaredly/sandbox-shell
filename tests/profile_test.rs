@@ -148,7 +148,7 @@ fn test_compose_profiles_empty() {
 #[test]
 fn test_compose_profiles_single() {
     let profile = BuiltinProfile::Base.load().unwrap();
-    let composed = compose_profiles(&[profile.clone()]);
+    let composed = compose_profiles(std::slice::from_ref(&profile));
     assert_eq!(
         composed.filesystem.allow_read,
         profile.filesystem.allow_read
