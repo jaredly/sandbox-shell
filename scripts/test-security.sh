@@ -73,6 +73,11 @@ sx_in_work() {
 
 POLICY=$(cd "$WORK" && "$SX_BIN" --dry-run 2>/dev/null || echo "")
 
+# Which mechanisms this machine actually uses, so a green run says what it
+# covered. On Linux the network path depends on whether user namespaces work.
+echo "$POLICY" | grep -E "^# (kernel|network|setuid)" | sed 's/^# /  /'
+echo ""
+
 echo "--- A. Policy shape ---"
 
 # A1: sensitive home paths are denied
