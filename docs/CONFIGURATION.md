@@ -137,6 +137,47 @@ sx --allow-exec-sugid /bin/ps --allow-exec-sugid /usr/bin/newgrp -- ps aux
 - `*_SECRET*` - matches `DATABASE_SECRET`, `MY_SECRET_KEY`…
 - `*_KEY` - matches `API_KEY`, `SSH_KEY`…
 
+## First Run: Prompt and Shell Tooling
+
+`sx` is deny-by-default, and that includes the tools your shell starts. Cache
+directories are readable but **not writable** on either platform, so anything
+that logs or caches per session will complain the first time you run `sx` with
+no global config:
+
+```
+Unable to open session log file "~/.cache/starship/session_....log": Permission denied
+```
+
+That is the sandbox working. Grant the specific paths your prompt and shell
+hooks need in `~/.config/sx/config.toml`:
+
+```toml
+[filesystem]
+allow_read = [
+    "~/.config/starship.toml",   # prompt config
+    "~/.config/mise",            # version manager config
+    "~/.local/share/mise",       # installed toolchains + shims
+    "~/.local/state/mise",
+    "~/.local/share/zoxide",     # directory jumper
+]
+allow_write = [
+    "~/.cache/starship",         # per-session prompt log
+    "~/.cache/mise",
+    "~/.local/state/mise",
+    "~/.local/share/zoxide",
+]
+```
+
+macOS equivalents live under `~/Library/Caches/` and
+`~/Library/Application Support/` — see the example at the top of this file.
+
+Keep these grants narrow. `allow_write = ["~/.cache"]` works, but a cache is a
+place tools later execute from, so widening it hands a compromised dependency a
+persistence foothold. Grant the individual directories instead.
+
+If something breaks and the cause is not obvious, `sx --explain` prints every
+resolved path, and `sx --dry-run` prints the policy itself.
+
 ## Per-OS Configuration
 
 The config format is identical on macOS and Linux, but the paths are not. Custom
