@@ -18,6 +18,11 @@ allow_read = [
     "/tmp",
     # sx config
     "~/.config/sx",
+    # Git treats a permission error on its user config as fatal, so
+    # `sx -- git status` needs these. Read-only, and not where git keeps
+    # credentials - ~/.git-credentials stays denied by default.
+    "~/.gitconfig",
+    "~/.config/git",
     # Shell config files (read-only)
     "~/.zshrc",
     "~/.zshenv",
@@ -99,11 +104,6 @@ allow_read = [
     "/run/systemd/resolve",
     "/var/lib/dbus",
     "/var/tmp",
-    # Git reads its user config from XDG on Linux and treats a permission
-    # error there as fatal, so `sx -- git status` needs it. Read-only, and it
-    # is not where git keeps credentials (~/.git-credentials stays denied).
-    "~/.gitconfig",
-    "~/.config/git",
     # XDG cache - parity with ~/Library/Caches on macOS
     "~/.cache",
     "~/.terminfo",
