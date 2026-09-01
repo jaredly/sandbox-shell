@@ -98,6 +98,8 @@ pub struct SandboxParams {
     pub deny_read: Vec<PathBuf>,
     /// Paths to allow writing (restricted by default)
     pub allow_write: Vec<PathBuf>,
+    /// Paths to explicitly deny writing (overrides allow_write, for sensitive subpaths)
+    pub deny_write: Vec<PathBuf>,
     /// Paths to allow directory listing only (readdir), not file contents.
     /// Uses Seatbelt `literal` filter - allows listing a directory's entries
     /// without granting access to files or subdirectories within it.
@@ -217,6 +219,23 @@ pub fn generate_seatbelt_profile(params: &SandboxParams) -> Result<String, Seatb
                 profile.push_str(&format!("(deny file-read* (regex #\"{regex}\"))\n"));
             } else {
                 profile.push_str(&format!("(deny file-read* (subpath \"{validated}\"))\n"));
+            }
+        }
+        profile.push('\n');
+    }
+
+    // Deny sensitive paths (overrides allow_write for nested sensitive paths)
+    // Uses last-match-wins: deny after allow takes precedence
+    if !params.deny_write.is_empty() {
+        profile.push_str("; Denied write paths (sensitive data)\n");
+        for path in &params.deny_write {
+            let p = path.display().to_string();
+            let validated = validate_seatbelt_path(&p)?;
+            if contains_glob(validated) {
+                let regex = glob_to_regex(validated);
+                profile.push_str(&format!("(deny file-write* (regex #\"{regex}\"))\n"));
+            } else {
+                profile.push_str(&format!("(deny file-write* (subpath \"{validated}\"))\n"));
             }
         }
         profile.push('\n');
