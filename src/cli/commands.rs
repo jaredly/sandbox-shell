@@ -80,6 +80,15 @@ pub fn explain(args: &Args) -> Result<()> {
         println!();
     }
 
+    // Denied write paths
+    if !context.params.deny_write.is_empty() {
+        println!("Denied Write Paths:");
+        for path in &context.params.deny_write {
+            println!("  - {}", path.display());
+        }
+        println!();
+    }
+
     // Directory listing only paths
     if !context.params.allow_list_dirs.is_empty() {
         println!("Directory Listing Only (readdir without file access):");

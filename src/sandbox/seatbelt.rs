@@ -224,23 +224,6 @@ pub fn generate_seatbelt_profile(params: &SandboxParams) -> Result<String, Seatb
         profile.push('\n');
     }
 
-    // Deny sensitive paths (overrides allow_write for nested sensitive paths)
-    // Uses last-match-wins: deny after allow takes precedence
-    if !params.deny_write.is_empty() {
-        profile.push_str("; Denied write paths (sensitive data)\n");
-        for path in &params.deny_write {
-            let p = path.display().to_string();
-            let validated = validate_seatbelt_path(&p)?;
-            if contains_glob(validated) {
-                let regex = glob_to_regex(validated);
-                profile.push_str(&format!("(deny file-write* (regex #\"{regex}\"))\n"));
-            } else {
-                profile.push_str(&format!("(deny file-write* (subpath \"{validated}\"))\n"));
-            }
-        }
-        profile.push('\n');
-    }
-
     // Working directory - full read/write access
     profile.push_str("; Working directory (full access)\n");
     if !params.working_dir.as_os_str().is_empty() {
@@ -265,6 +248,23 @@ pub fn generate_seatbelt_profile(params: &SandboxParams) -> Result<String, Seatb
                 profile.push_str(&format!("(allow file* (regex #\"^{escaped}.*\"))\n"));
             } else {
                 profile.push_str(&format!("(allow file-write* (subpath \"{validated}\"))\n"));
+            }
+        }
+        profile.push('\n');
+    }
+
+    // Deny sensitive write paths (overrides allow_write for nested sensitive paths)
+    // Uses last-match-wins: deny after allow takes precedence
+    if !params.deny_write.is_empty() {
+        profile.push_str("; Denied write paths (sensitive data)\n");
+        for path in &params.deny_write {
+            let p = path.display().to_string();
+            let validated = validate_seatbelt_path(&p)?;
+            if contains_glob(validated) {
+                let regex = glob_to_regex(validated);
+                profile.push_str(&format!("(deny file-write* (regex #\"{regex}\"))\n"));
+            } else {
+                profile.push_str(&format!("(deny file-write* (subpath \"{validated}\"))\n"));
             }
         }
         profile.push('\n');
@@ -569,6 +569,28 @@ mod tests {
             .expect("deny rule should exist");
         let allow_pos = profile
             .find("(allow file-read* (subpath \"/home\"))")
+            .expect("allow rule should exist");
+
+        assert!(
+            deny_pos > allow_pos,
+            "deny rules must come after allow rules for Seatbelt last-match-wins semantics"
+        );
+    }
+
+    #[test]
+    fn test_deny_rules_come_after_allow_write() {
+        let params = SandboxParams {
+            allow_write: vec![PathBuf::from("/home")],
+            deny_write: vec![PathBuf::from("/home/.config")],
+            ..Default::default()
+        };
+        let profile = generate_seatbelt_profile(&params).unwrap();
+
+        let deny_pos = profile
+            .find("(deny file-write* (subpath \"/home/.config\"))")
+            .expect("deny rule should exist");
+        let allow_pos = profile
+            .find("(allow file-write* (subpath \"/home\"))")
             .expect("allow rule should exist");
 
         assert!(
